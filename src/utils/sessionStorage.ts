@@ -3,6 +3,7 @@ const STORE_NAME = 'sessions';
 const CHUNK_AUDIO_STORE = 'chunk_audio_blobs';
 const CURRENT_KEY = 'active_session';
 const HISTORY_KEY = 'sessions_history_list';
+const LS_ACTIVE_SESSION_CLEARED_KEY = 'audiospark_active_session_cleared_v1';
 
 // Synchronous localStorage emergency backup keys (Survives instant tab crash / refresh!)
 const LS_EMERGENCY_META_KEY = 'audiospark_emergency_session_meta_v2';
@@ -64,6 +65,14 @@ export interface PersistedUserPrefs {
   draftPrompt?: string;
 }
 
+export function hasActiveSessionClearMarker(): boolean {
+  try {
+    return localStorage.getItem(LS_ACTIVE_SESSION_CLEARED_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
 export function saveUserPreferences(prefs: PersistedUserPrefs): void {
   try {
     const existingRaw = localStorage.getItem(LS_USER_PREFS_KEY);
@@ -111,8 +120,8 @@ export function stripAudioForLightweightMeta(sessionData: any): any {
  * Saves individual chunk audio base64 in its own dedicated IndexedDB key
  * so even 50+ clips never blow up a single object transaction or cause browser OOM crashes.
  */
-export async function saveChunkAudioBricks(sessionId: string, chunks: any[]): Promise<void> {
-  if (!Array.isArray(chunks) || chunks.length === 0) return;
+export async function saveChunkAudioBricks(sessionId: string, chunks: any[]): Promise<boolean> {
+  if (!Array.isArray(chunks) || chunks.length === 0) return false;
   const toWrite = chunks.filter((c) => {
     if (!c || !c.id || !c.audioBase64) return false;
     const brickKey = `${sessionId}_chunk_${c.id}_${c.audioBase64.length}`;
@@ -120,21 +129,28 @@ export async function saveChunkAudioBricks(sessionId: string, chunks: any[]): Pr
     return true;
   });
 
-  if (toWrite.length === 0) return;
+  if (toWrite.length === 0) return true;
 
   try {
     const db = await openDB();
-    await new Promise<void>((resolve) => {
+    return await new Promise<boolean>((resolve) => {
       const tx = db.transaction(CHUNK_AUDIO_STORE, 'readwrite');
       const store = tx.objectStore(CHUNK_AUDIO_STORE);
       for (const c of toWrite) {
         store.put(c.audioBase64, `${sessionId}_chunk_${c.id}`);
-        writtenAudioBrickKeys.add(`${sessionId}_chunk_${c.id}_${c.audioBase64.length}`);
       }
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
+      tx.oncomplete = () => {
+        for (const c of toWrite) {
+          writtenAudioBrickKeys.add(`${sessionId}_chunk_${c.id}_${c.audioBase64.length}`);
+        }
+        resolve(true);
+      };
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
     });
-  } catch {}
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -145,40 +161,34 @@ export async function rehydrateSessionAudioBricks(sessionData: any): Promise<any
   const sessionId = sessionData.id || 'session-assistant-1';
   let hydratedChunks = [...sessionData.completedChunks];
 
-  // 1. Check local IndexedDB audio brick store
+  const legacyAudioChunks = hydratedChunks.filter((chunk: any) => chunk?.audioBase64);
+  if (legacyAudioChunks.length > 0) {
+    await saveChunkAudioBricks(sessionId, legacyAudioChunks);
+    hydratedChunks = hydratedChunks.map((chunk: any) =>
+      chunk.audioBase64
+        ? { ...chunk, audioBase64: undefined, hasAudioSaved: true, localAudioAvailable: true }
+        : chunk
+    );
+  }
+
+  // 1. Check local brick keys without loading large audio strings into application memory.
   try {
     const db = await openDB();
     hydratedChunks = await Promise.all(
       hydratedChunks.map(async (c: any) => {
-        if (c.audioBase64) return { ...c, hasAudioSaved: true };
+        if (c.localAudioAvailable) return c;
         return new Promise<any>((resolve) => {
-          let resolved = false;
-          const done = (val: any) => {
-            if (!resolved) {
-              resolved = true;
-              resolve(val);
-            }
-          };
-          const safetyTimer = setTimeout(() => done(c), 500);
           try {
             const tx = db.transaction(CHUNK_AUDIO_STORE, 'readonly');
             const store = tx.objectStore(CHUNK_AUDIO_STORE);
-            const req = store.get(`${sessionId}_chunk_${c.id}`);
+            const req = store.getKey(`${sessionId}_chunk_${c.id}`);
             req.onsuccess = () => {
-              clearTimeout(safetyTimer);
-              if (req.result) {
-                done({ ...c, audioBase64: req.result, hasAudioSaved: true });
-              } else {
-                done(c);
-              }
+              const localAudioAvailable = req.result !== undefined;
+              resolve({ ...c, hasAudioSaved: Boolean(c.hasAudioSaved || localAudioAvailable), localAudioAvailable });
             };
-            req.onerror = () => {
-              clearTimeout(safetyTimer);
-              done(c);
-            };
+            req.onerror = () => resolve(c);
           } catch {
-            clearTimeout(safetyTimer);
-            done(c);
+            resolve(c);
           }
         });
       })
@@ -198,14 +208,14 @@ export async function rehydrateSessionAudioBricks(sessionData: any): Promise<any
         hydratedChunks = hydratedChunks.map((c: any) => {
           const sc = serverChunks.find((item: any) => item.id === c.id);
           const hasAudioOnServer = Boolean(sc?.hasAudioSaved || sc?.audioUrl);
-          const audioUrl = c.audioUrl || sc?.audioUrl || (hasAudioOnServer ? `/api/session/chunk-audio/${encodeURIComponent(sessionId)}/${encodeURIComponent(c.id)}` : undefined);
           return {
             ...c,
             text: c.text || sc?.text || '',
             title: c.title || sc?.title || `Clip ${c.id}`,
             wordCount: c.wordCount || sc?.wordCount || 0,
             hasAudioSaved: Boolean(c.audioBase64 || c.hasAudioSaved || hasAudioOnServer),
-            audioUrl: c.audioUrl || audioUrl,
+            audioUrl: sc?.audioUrl || (hasAudioOnServer ? `/api/session/chunk-audio/${encodeURIComponent(sessionId)}/${encodeURIComponent(c.id)}` : undefined),
+            serverAudioAvailable: hasAudioOnServer,
           };
         });
       }
@@ -215,9 +225,10 @@ export async function rehydrateSessionAudioBricks(sessionData: any): Promise<any
   // 3. Ensure hasAudioSaved and audioUrl are valid for all completed clips
   hydratedChunks = hydratedChunks.map((c: any) => {
     const hasAudio = Boolean(c.audioBase64 || c.hasAudioSaved || c.audioUrl);
-    const audioUrl = c.audioUrl || (hasAudio ? `/api/session/chunk-audio/${encodeURIComponent(sessionId)}/${encodeURIComponent(c.id)}` : undefined);
+    const audioUrl = c.audioUrl || (c.serverAudioAvailable ? `/api/session/chunk-audio/${encodeURIComponent(sessionId)}/${encodeURIComponent(c.id)}` : undefined);
     return {
       ...c,
+      audioBase64: undefined,
       hasAudioSaved: hasAudio,
       audioUrl,
     };
@@ -240,6 +251,20 @@ export async function fetchChunkAudioBase64(sessionId: string, chunkId: number |
   return null;
 }
 
+export async function loadLocalChunkAudioBase64(sessionId: string, chunkId: number | string): Promise<string | null> {
+  try {
+    const db = await openDB();
+    return await new Promise<string | null>((resolve) => {
+      const tx = db.transaction(CHUNK_AUDIO_STORE, 'readonly');
+      const request = tx.objectStore(CHUNK_AUDIO_STORE).get(`${sessionId}_chunk_${chunkId}`);
+      request.onsuccess = () => resolve(typeof request.result === 'string' ? request.result : null);
+      request.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+}
+
 export async function saveLocalSession(sessionData: any): Promise<void> {
   if (!sessionData) return;
   const sessionId = sessionData.id || 'session-assistant-1';
@@ -249,6 +274,7 @@ export async function saveLocalSession(sessionData: any): Promise<void> {
   // LAYER 1: Instant Synchronous localStorage write of scripts + plan (0ms, crash-proof!)
   try {
     localStorage.setItem(LS_EMERGENCY_META_KEY, JSON.stringify(lightMeta));
+    localStorage.removeItem(LS_ACTIVE_SESSION_CLEARED_KEY);
 
     const rawHist = localStorage.getItem(LS_EMERGENCY_HISTORY_KEY);
     const histList: any[] = rawHist ? JSON.parse(rawHist) : [];
@@ -289,6 +315,7 @@ export async function saveLocalSession(sessionData: any): Promise<void> {
 export async function clearActiveLocalSession(): Promise<void> {
   try {
     localStorage.removeItem(LS_EMERGENCY_META_KEY);
+    localStorage.setItem(LS_ACTIVE_SESSION_CLEARED_KEY, 'true');
   } catch {}
   try {
     const db = await openDB();
@@ -349,7 +376,7 @@ export async function loadLocalSession(): Promise<any | null> {
   const chosen = lsCount > idbCount ? lsSession : idbSession || lsSession;
 
   if (!chosen) return null;
-  return await rehydrateSessionAudioBricks(chosen);
+  return chosen;
 }
 
 export async function loadSessionsHistory(): Promise<any[]> {
@@ -434,7 +461,7 @@ export async function upsertSessionInHistory(sessionData: any): Promise<any[]> {
 }
 
 export async function deleteSessionFromHistory(sessionId: string): Promise<any[]> {
-  fetch(`/api/session/delete/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }).catch(() => {});
+  const serverDelete = fetch(`/api/session/delete/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
   try {
     const raw = localStorage.getItem(LS_EMERGENCY_HISTORY_KEY);
     if (raw) {
@@ -451,12 +478,33 @@ export async function deleteSessionFromHistory(sessionId: string): Promise<any[]
     const nextList = currentList.filter((item) => item.id !== sessionId);
     const db = await openDB();
     await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const tx = db.transaction([STORE_NAME, CHUNK_AUDIO_STORE], 'readwrite');
       const store = tx.objectStore(STORE_NAME);
+      const audioStore = tx.objectStore(CHUNK_AUDIO_STORE);
       store.put(nextList, HISTORY_KEY);
+      const cursorRequest = audioStore.openCursor();
+      cursorRequest.onsuccess = () => {
+        const cursor = cursorRequest.result;
+        if (!cursor) return;
+        if (String(cursor.key).startsWith(`${sessionId}_chunk_`)) cursor.delete();
+        cursor.continue();
+      };
+      const activeRequest = store.get(CURRENT_KEY);
+      activeRequest.onsuccess = () => {
+        if (activeRequest.result?.id === sessionId) {
+          store.delete(CURRENT_KEY);
+          try {
+            localStorage.setItem(LS_ACTIVE_SESSION_CLEARED_KEY, 'true');
+          } catch {}
+        }
+      };
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
+    await serverDelete.catch(() => undefined);
+    for (const key of writtenAudioBrickKeys) {
+      if (key.startsWith(`${sessionId}_chunk_`)) writtenAudioBrickKeys.delete(key);
+    }
     return nextList;
   } catch {
     return [];

@@ -3,14 +3,16 @@ import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
+import { Readable, Transform } from 'stream';
 import { GoogleGenAI } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
-import JSZip from 'jszip';
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const { ZipArchive } = createRequire(import.meta.url)('archiver') as typeof import('archiver');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -30,6 +32,7 @@ const ai = new GoogleGenAI({
 // Session persistence & multi-session history so active/past sessions are NEVER lost
 const SESSION_FILE = path.resolve(__dirname, 'src/persistedSession.json');
 const HISTORY_FILE = path.resolve(__dirname, 'src/persistedHistory.json');
+const ACTIVE_SESSION_CLEARED_FILE = path.resolve(__dirname, 'src/persistedActiveSessionCleared.json');
 const AUDIO_CHUNKS_DIR = path.resolve(__dirname, 'src/persisted_audio_chunks');
 
 try {
@@ -44,6 +47,102 @@ function sanitizeId(raw: string): string {
 
 function getChunkAudioPath(sessionId: string, chunkId: number | string): string {
   return path.join(AUDIO_CHUNKS_DIR, `${sanitizeId(sessionId)}_chunk_${sanitizeId(String(chunkId))}.b64`);
+}
+
+function decodeBase64File(filePath: string, skipBytes = 0): Readable {
+  let carry = '';
+  let remainingSkip = skipBytes;
+  const decoder = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      const input = (carry + chunk.toString('ascii')).replace(/\s/g, '');
+      const usableLength = input.length - (input.length % 4);
+      carry = input.slice(usableLength);
+      let decoded = Buffer.from(input.slice(0, usableLength), 'base64');
+      if (remainingSkip > 0) {
+        const skip = Math.min(remainingSkip, decoded.length);
+        decoded = decoded.subarray(skip);
+        remainingSkip -= skip;
+      }
+      if (decoded.length > 0) this.push(decoded);
+      callback();
+    },
+    flush(callback) {
+      let decoded = carry ? Buffer.from(carry, 'base64') : Buffer.alloc(0);
+      if (remainingSkip > 0) decoded = decoded.subarray(Math.min(remainingSkip, decoded.length));
+      if (decoded.length > 0) this.push(decoded);
+      callback();
+    },
+  });
+  return fs.createReadStream(filePath).pipe(decoder);
+}
+
+function wavHeader(pcmLength: number): Buffer {
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcmLength, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(24000, 24);
+  header.writeUInt32LE(48000, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcmLength, 40);
+  return header;
+}
+
+function decodedBase64Length(filePath: string): number {
+  const size = fs.statSync(filePath).size;
+  const tail = Buffer.alloc(Math.min(2, size));
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    fs.readSync(fd, tail, 0, tail.length, size - tail.length);
+  } finally {
+    fs.closeSync(fd);
+  }
+  const padding = tail.toString('ascii').match(/=+$/)?.[0].length || 0;
+  return Math.floor(size / 4) * 3 - padding;
+}
+
+async function* streamMasterWav(
+  sessionId: string,
+  chunks: any[],
+  pcmLength: number,
+  pauseBytes: number,
+  byteStart = 0,
+  byteEnd = pcmLength + 43
+) {
+  let position = 0;
+  const emitRange = async function* (source: Readable) {
+    for await (const chunk of source) {
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const segmentStart = position;
+      position += data.length;
+      const from = Math.max(0, byteStart - segmentStart);
+      const to = Math.min(data.length, byteEnd - segmentStart + 1);
+      if (to > from) yield data.subarray(from, to);
+      if (position > byteEnd) return;
+    }
+  };
+
+  yield* emitRange(Readable.from([wavHeader(pcmLength)]));
+  const availableChunks = chunks.filter((chunk) => fs.existsSync(getChunkAudioPath(sessionId, chunk.id)));
+  for (let index = 0; index < availableChunks.length; index++) {
+    const filePath = getChunkAudioPath(sessionId, availableChunks[index].id);
+    yield* emitRange(decodeBase64File(filePath, 44));
+    if (pauseBytes > 0 && index < availableChunks.length - 1) {
+      yield* emitRange(Readable.from([Buffer.alloc(pauseBytes)]));
+    }
+  }
+}
+
+function getInterClipPauseBytes(rawGap: unknown): number {
+  const parsedGap = Number(rawGap);
+  const seconds = Math.max(0, Math.min(8, Number.isFinite(parsedGap) ? parsedGap : 1.5));
+  return Math.floor(seconds * 24000) * 2;
 }
 
 function extractAndSaveServerAudioBricks(session: any): any {
@@ -65,6 +164,7 @@ function extractAndSaveServerAudioBricks(session: any): any {
           text: c.text,
           customPrompt: c.customPrompt,
           hasAudioSaved: Boolean(c.audioBase64 || chunkExistsOnDisk),
+          driveLink: c.driveLink,
         };
         return lightChunk;
       })
@@ -93,6 +193,7 @@ function prepareSessionMetadata(session: any): any {
           text: c.text,
           customPrompt: c.customPrompt,
           hasAudioSaved: hasAudio,
+          driveLink: c.driveLink,
           audioUrl: hasAudio
             ? `/api/session/chunk-audio/${encodeURIComponent(sessionId)}/${encodeURIComponent(c.id)}`
             : undefined,
@@ -156,13 +257,16 @@ app.get('/api/session/current', (_req, res) => {
     if (fs.existsSync(SESSION_FILE)) {
       const content = fs.readFileSync(SESSION_FILE, 'utf-8');
       const session = prepareSessionMetadata(JSON.parse(content));
-      return res.json({ session, history });
+      return res.json({ session, history, activeSessionCleared: false });
+    }
+    if (fs.existsSync(ACTIVE_SESSION_CLEARED_FILE)) {
+      return res.json({ session: null, history, activeSessionCleared: true });
     }
     // If active session file is absent, return the most recent history session so progress is never lost
     if (history.length > 0) {
-      return res.json({ session: history[0], history });
+      return res.json({ session: history[0], history, activeSessionCleared: false });
     }
-    return res.json({ session: null, history: [] });
+    return res.json({ session: null, history: [], activeSessionCleared: false });
   } catch (err: any) {
     console.error('Error reading session file:', err);
     return res.json({ session: null, history: [] });
@@ -246,7 +350,7 @@ app.get('/api/session/chunk-audio-b64/:sessionId/:chunkId', (req, res) => {
 });
 
 // Stream continuous Master WAV stitched directly from disk chunks
-app.get('/api/session/master-audio/:sessionId', (req, res) => {
+app.get('/api/session/master-audio/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params;
     const history = readServerHistory();
@@ -257,46 +361,61 @@ app.get('/api/session/master-audio/:sessionId', (req, res) => {
       return res.status(404).json({ error: 'Session has no clips to merge' });
     }
 
-    const pcmBuffers: Buffer[] = [];
-    let firstHeader: Buffer | null = null;
+    const pauseBytes = getInterClipPauseBytes(req.query.gap);
     let totalPcmLength = 0;
 
     for (const c of session.completedChunks) {
       const p = getChunkAudioPath(sessionId, c.id);
       if (!fs.existsSync(p)) continue;
-      const b64 = fs.readFileSync(p, 'utf-8').trim();
-      const buf = Buffer.from(b64, 'base64');
-      if (buf.length <= 44) continue;
-
-      if (!firstHeader) {
-        firstHeader = Buffer.from(buf.subarray(0, 44));
-      }
-      const pcm = buf.subarray(44);
-      pcmBuffers.push(pcm);
-      totalPcmLength += pcm.length;
+      totalPcmLength += Math.max(0, decodedBase64Length(p) - 44);
     }
 
-    if (!firstHeader || totalPcmLength === 0) {
+    const missingChunks = session.completedChunks.filter((chunk: any) => !fs.existsSync(getChunkAudioPath(sessionId, chunk.id)));
+    if (missingChunks.length > 0) {
+      return res.status(409).json({ error: 'Some clip audio is not saved on the server.', missingChunkIds: missingChunks.map((chunk: any) => chunk.id) });
+    }
+
+    totalPcmLength += pauseBytes * Math.max(0, session.completedChunks.length - 1);
+
+    if (totalPcmLength === 0) {
       return res.status(404).json({ error: 'No audio data found for session' });
     }
 
-    const mergedWav = Buffer.alloc(44 + totalPcmLength);
-    firstHeader.copy(mergedWav, 0, 0, 44);
-    mergedWav.writeUInt32LE(36 + totalPcmLength, 4);
-    mergedWav.writeUInt32LE(totalPcmLength, 40);
-
-    let offset = 44;
-    for (const pcm of pcmBuffers) {
-      pcm.copy(mergedWav, offset);
-      offset += pcm.length;
+    const totalSize = 44 + totalPcmLength;
+    let byteStart = 0;
+    let byteEnd = totalSize - 1;
+    const rangeHeader = req.headers.range;
+    if (rangeHeader) {
+      const rangeMatch = rangeHeader.match(/^bytes=(\d*)-(\d*)$/);
+      if (!rangeMatch || (!rangeMatch[1] && !rangeMatch[2])) {
+        res.setHeader('Content-Range', `bytes */${totalSize}`);
+        return res.status(416).end();
+      }
+      if (!rangeMatch[1]) {
+        const suffixLength = Number(rangeMatch[2]);
+        byteStart = Math.max(0, totalSize - suffixLength);
+      } else {
+        byteStart = Number(rangeMatch[1]);
+        if (rangeMatch[2]) byteEnd = Math.min(byteEnd, Number(rangeMatch[2]));
+      }
+      if (byteStart >= totalSize || byteStart > byteEnd) {
+        res.setHeader('Content-Range', `bytes */${totalSize}`);
+        return res.status(416).end();
+      }
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${byteStart}-${byteEnd}/${totalSize}`);
     }
 
     const filenameSlug = (session.topic || 'narration').toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
     res.setHeader('Content-Type', 'audio/wav');
-    res.setHeader('Content-Length', mergedWav.length);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Content-Length', byteEnd - byteStart + 1);
     res.setHeader('Content-Disposition', `attachment; filename="${filenameSlug}-master.wav"`);
     res.setHeader('Cache-Control', 'public, max-age=86400');
-    return res.end(mergedWav);
+    for await (const data of streamMasterWav(sessionId, session.completedChunks, totalPcmLength, pauseBytes, byteStart, byteEnd)) {
+      if (!res.write(data)) await new Promise<void>((resolve) => res.once('drain', resolve));
+    }
+    return res.end();
   } catch (err: any) {
     console.error('Error generating master audio on server:', err);
     return res.status(500).json({ error: err?.message || 'Failed to generate master audio' });
@@ -308,6 +427,7 @@ app.get('/api/session/download-zip/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params;
     const mode = (req.query.mode as string) || 'both_parts_and_master';
+    const pauseBytes = getInterClipPauseBytes(req.query.gap);
     const history = readServerHistory();
     const current = fs.existsSync(SESSION_FILE) ? JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8')) : null;
     const session = (current && current.id === sessionId) ? current : history.find((h: any) => h.id === sessionId);
@@ -316,13 +436,29 @@ app.get('/api/session/download-zip/:sessionId', async (req, res) => {
       return res.status(404).json({ error: 'Session has no clips to package' });
     }
 
-    const zip = new JSZip();
+    const needsAudio = mode === 'both_parts_and_master' || mode === 'parts_only' || mode === 'single_master_wav';
+    const missingChunks = needsAudio
+      ? session.completedChunks.filter((chunk: any) => !fs.existsSync(getChunkAudioPath(sessionId, chunk.id)))
+      : [];
+    if (missingChunks.length > 0) {
+      return res.status(409).json({ error: 'Some clip audio is not saved on the server.', missingChunkIds: missingChunks.map((chunk: any) => chunk.id) });
+    }
+
     const filenameSlug = (session.topic || 'narration').toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
+    const archive = new ZipArchive({ zlib: { level: 1 } });
+    archive.on('warning', (warning) => console.warn('Audio ZIP warning:', warning));
+    archive.on('error', (error) => {
+      console.error('Audio ZIP stream error:', error);
+      res.destroy(error);
+    });
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filenameSlug}-audio-package.zip"`);
+    archive.pipe(res);
 
     // 1. Full script text
     const fullScript = session.fullCombinedScript || session.fullScriptText || session.completedChunks.map((c: any) => c.text).join('\n\n');
     if (fullScript) {
-      zip.file(`${filenameSlug}-complete-script.txt`, fullScript);
+      archive.append(fullScript, { name: `${filenameSlug}-complete-script.txt` });
     }
 
     // 2. Individual clips
@@ -330,51 +466,32 @@ app.get('/api/session/download-zip/:sessionId', async (req, res) => {
       for (const c of session.completedChunks) {
         const p = getChunkAudioPath(sessionId, c.id);
         if (fs.existsSync(p)) {
-          const b64 = fs.readFileSync(p, 'utf-8').trim();
-          const buf = Buffer.from(b64, 'base64');
           const pad = String(c.id).padStart(2, '0');
-          zip.file(`parts/${pad}-${filenameSlug}-clip-${c.id}.wav`, buf);
+          archive.append(decodeBase64File(p), { name: `parts/${pad}-${filenameSlug}-clip-${c.id}.wav` });
         }
       }
     }
 
     // 3. Stitched Master WAV
     if (mode === 'both_parts_and_master' || mode === 'single_master_wav') {
-      const pcmBuffers: Buffer[] = [];
-      let firstHeader: Buffer | null = null;
       let totalPcm = 0;
 
       for (const c of session.completedChunks) {
         const p = getChunkAudioPath(sessionId, c.id);
         if (!fs.existsSync(p)) continue;
-        const b64 = fs.readFileSync(p, 'utf-8').trim();
-        const buf = Buffer.from(b64, 'base64');
-        if (buf.length <= 44) continue;
-        if (!firstHeader) firstHeader = Buffer.from(buf.subarray(0, 44));
-        const pcm = buf.subarray(44);
-        pcmBuffers.push(pcm);
-        totalPcm += pcm.length;
+        totalPcm += Math.max(0, decodedBase64Length(p) - 44);
       }
 
-      if (firstHeader && totalPcm > 0) {
-        const masterWav = Buffer.alloc(44 + totalPcm);
-        firstHeader.copy(masterWav, 0, 0, 44);
-        masterWav.writeUInt32LE(36 + totalPcm, 4);
-        masterWav.writeUInt32LE(totalPcm, 40);
-        let offset = 44;
-        for (const pcm of pcmBuffers) {
-          pcm.copy(masterWav, offset);
-          offset += pcm.length;
-        }
-        zip.file(`${filenameSlug}-master-complete.wav`, masterWav);
+      totalPcm += pauseBytes * Math.max(0, session.completedChunks.length - 1);
+
+      if (totalPcm > 0) {
+        archive.append(Readable.from(streamMasterWav(sessionId, session.completedChunks, totalPcm, pauseBytes)), {
+          name: `${filenameSlug}-master-complete.wav`,
+        });
       }
     }
 
-    const zipBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 4 } });
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Length', zipBuffer.length);
-    res.setHeader('Content-Disposition', `attachment; filename="${filenameSlug}-audio-package.zip"`);
-    return res.end(zipBuffer);
+    await archive.finalize();
   } catch (err: any) {
     console.error('Error generating server ZIP:', err);
     return res.status(500).json({ error: err?.message || 'Failed to generate zip package' });
@@ -384,9 +501,13 @@ app.get('/api/session/download-zip/:sessionId', async (req, res) => {
 app.post('/api/session/save-chunk-audio', (req, res) => {
   try {
     const { sessionId, chunkId, audioBase64 } = req.body;
-    if (sessionId && chunkId != null && audioBase64) {
-      fs.writeFileSync(getChunkAudioPath(sessionId, chunkId), audioBase64, 'utf-8');
+    if (!sessionId || chunkId == null || typeof audioBase64 !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(audioBase64)) {
+      return res.status(400).json({ success: false, error: 'Valid sessionId, chunkId, and base64 audio are required.' });
     }
+    const audioPath = getChunkAudioPath(sessionId, chunkId);
+    const temporaryPath = `${audioPath}.tmp`;
+    fs.writeFileSync(temporaryPath, audioBase64, 'utf-8');
+    fs.renameSync(temporaryPath, audioPath);
     return res.json({ success: true });
   } catch (err: any) {
     console.error('Error saving chunk audio brick:', err);
@@ -410,6 +531,13 @@ app.delete('/api/session/delete/:id', (req, res) => {
       } catch {}
     }
 
+    const audioPrefix = `${sanitizeId(targetId)}_chunk_`;
+    for (const filename of fs.readdirSync(AUDIO_CHUNKS_DIR)) {
+      if (filename.startsWith(audioPrefix)) {
+        fs.unlinkSync(path.join(AUDIO_CHUNKS_DIR, filename));
+      }
+    }
+
     return res.json({ success: true, history: filtered });
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || 'Failed to delete session' });
@@ -428,12 +556,17 @@ app.post('/api/session/save', (req, res) => {
             upsertServerHistory(existing);
           }
         } catch {}
+        fs.unlinkSync(SESSION_FILE);
       }
-      return res.json({ success: true, cleared: true, history: readServerHistory() });
+      atomicWriteJson(ACTIVE_SESSION_CLEARED_FILE, { clearedAt: new Date().toISOString() });
+      return res.json({ success: true, cleared: true, activeSessionCleared: true, history: readServerHistory() });
     }
     if (session) {
       const cleanSession = extractAndSaveServerAudioBricks(session);
       atomicWriteJson(SESSION_FILE, cleanSession);
+      if (fs.existsSync(ACTIVE_SESSION_CLEARED_FILE)) {
+        fs.unlinkSync(ACTIVE_SESSION_CLEARED_FILE);
+      }
       const history = upsertServerHistory(cleanSession);
       return res.json({ success: true, history });
     }

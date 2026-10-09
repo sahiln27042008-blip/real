@@ -34,10 +34,10 @@ import {
   FolderOpen,
 } from 'lucide-react';
 import { getScriptSlug } from './utils/fileNaming';
-import { downloadAudioOutput, DownloadPackageMode } from './utils/zipExport';
+import { DownloadPackageMode } from './utils/zipExport';
 import {
-  mergeWavAudioChunks,
   softenSingleWavBase64,
+  softenWavInWorker,
   splitRawScriptInto550To600WordClips,
   AcousticWarmthMode,
 } from './utils/wavMerger';
@@ -49,11 +49,12 @@ import {
   loadSessionsHistory,
   deleteSessionFromHistory,
   rehydrateSessionAudioBricks,
-  fetchChunkAudioBase64,
+  loadLocalChunkAudioBase64,
   exportSessionBackupJson,
   stripAudioForLightweightMeta,
   saveUserPreferences,
   loadUserPreferences,
+  hasActiveSessionClearMarker,
 } from './utils/sessionStorage';
 import {
   googleSignIn,
@@ -300,6 +301,7 @@ export function AppContent() {
   const [driveUploadingChunkId, setDriveUploadingChunkId] = useState<number | null>(null);
   const [driveUploadingAction, setDriveUploadingAction] = useState<string | null>(null);
   const [driveSuccessToast, setDriveSuccessToast] = useState<{ message: string; link?: string } | null>(null);
+  const [driveSaveStatus, setDriveSaveStatus] = useState<string>('Drive not connected');
 
   // Mandatory confirmation dialog for Workspace mutations
   const [driveConfirmModal, setDriveConfirmModal] = useState<{
@@ -424,29 +426,18 @@ export function AppContent() {
 
   const reconstructChunkAudioUrls = (
     chunks: CompletedChunk[],
-    warmth: AcousticWarmthMode = acousticWarmth,
-    speed: number = playbackRate,
+    _warmth: AcousticWarmthMode = acousticWarmth,
+    _speed: number = playbackRate,
     sessionId?: string
   ): CompletedChunk[] => {
     return chunks.map((chunk) => {
-      if (chunk.audioBase64) {
-        try {
-          const softened = softenSingleWavBase64(chunk.audioBase64, warmth, speed);
-          return { ...chunk, audioUrl: softened.blobUrl };
-        } catch {
-          return chunk;
-        }
-      }
-      if (chunk.audioUrl) {
-        return chunk;
-      }
-      if ((chunk as any).hasAudioSaved && sessionId) {
+      if ((chunk as any).serverAudioAvailable && sessionId) {
         return {
           ...chunk,
           audioUrl: `/api/session/chunk-audio/${encodeURIComponent(sessionId)}/${encodeURIComponent(chunk.id)}`,
         };
       }
-      return chunk;
+      return { ...chunk, audioUrl: undefined };
     });
   };
 
@@ -470,17 +461,9 @@ export function AppContent() {
       (c) => !c.audioBase64 && !(c as any).hasAudioSaved && !c.audioUrl
     ).length;
 
-    // Automatically rebuild Master Audio URL if completed audio chunks exist so "Play Full Master Audio" is immediately ready after refresh!
-    let autoMasterUrl: string | undefined = undefined;
-    const readyAudioBase64s = chunksWithUrls.map((c) => c.audioBase64!).filter(Boolean);
-    if (readyAudioBase64s.length > 0) {
-      try {
-        const merged = mergeWavAudioChunks(readyAudioBase64s, acousticWarmth, playbackRate, interClipPauseSec);
-        autoMasterUrl = merged.blobUrl;
-      } catch {}
-    } else if (chunksWithUrls.some((c) => (c as any).hasAudioSaved || c.audioUrl)) {
-      autoMasterUrl = `/api/session/master-audio/${encodeURIComponent(assistantMsgId)}`;
-    }
+    const autoMasterUrl = chunksWithUrls.some((c) => (c as any).serverAudioAvailable || c.audioUrl?.startsWith('/api/session/chunk-audio/'))
+      ? `/api/session/master-audio/${encodeURIComponent(assistantMsgId)}?gap=${encodeURIComponent(interClipPauseSec)}`
+      : undefined;
 
     let statusText = `Saved (${totalWordsSoFar.toLocaleString()} / ${targetWords.toLocaleString()} words across ${chunksWithUrls.length} clips). Ready to resume.`;
     if (pendingAudioCount > 0) {
@@ -528,9 +511,11 @@ export function AppContent() {
   useEffect(() => {
     const init = async () => {
       try {
+        const localSessionWasCleared = hasActiveSessionClearMarker();
         const localHistory = await loadSessionsHistory();
         let combinedHistory = [...localHistory];
         let serverSess: any = null;
+        let serverSessionWasCleared = false;
 
         try {
           const ctrl = new AbortController();
@@ -538,6 +523,7 @@ export function AppContent() {
           const res = await fetch('/api/session/current', { signal: ctrl.signal });
           clearTimeout(timer);
           const data = await res.json();
+          serverSessionWasCleared = Boolean(data?.activeSessionCleared);
           if (Array.isArray(data?.history) && data.history.length > 0) {
             const existingIds = new Set(combinedHistory.map((h) => h.id));
             for (const hItem of data.history) {
@@ -546,7 +532,7 @@ export function AppContent() {
               }
             }
           }
-          if (data?.session && (data.session.completedChunks?.length > 0 || data.session.userPrompt)) {
+          if (!serverSessionWasCleared && data?.session && (data.session.completedChunks?.length > 0 || data.session.userPrompt)) {
             serverSess = data.session;
           }
         } catch {}
@@ -556,10 +542,15 @@ export function AppContent() {
         // Compare serverSess and localSess and pick whichever has MORE completed chunks / audio!
         const serverCount = serverSess?.completedChunks?.length || 0;
         const localCount = localSess?.completedChunks?.length || 0;
-        let sess: any = localCount >= serverCount ? localSess || serverSess : serverSess || localSess;
+        const activeSessionWasCleared = localSessionWasCleared || serverSessionWasCleared;
+        let sess: any = activeSessionWasCleared
+          ? null
+          : localCount >= serverCount
+            ? localSess || serverSess
+            : serverSess || localSess;
 
-        // CRITICAL RECOVERY: If active_session was cleared, automatically recover the most recent session from History!
-        if (!sess && combinedHistory.length > 0) {
+        // Recover from history only when active-session storage disappeared unexpectedly.
+        if (!activeSessionWasCleared && !sess && combinedHistory.length > 0) {
           const bestHistoryItem =
             combinedHistory.find((h) => h.completedChunks && h.completedChunks.length > 0) ||
             combinedHistory[0];
@@ -621,6 +612,7 @@ export function AppContent() {
       audioBase64: undefined, // Keep memory lean and clean (< 50KB)
       hasAudioSaved: Boolean(c.hasAudioSaved || c.audioUrl || c.audioBase64),
       customPrompt: c.customPrompt,
+      driveLink: c.driveLink,
     }));
 
     const sessionObj = {
@@ -668,31 +660,43 @@ export function AppContent() {
     }
   };
 
+  const handlePlayChunkAudio = async (sessionId: string, chunk: CompletedChunk) => {
+    let audioUrl = chunk.audioUrl;
+    if (!audioUrl && ((chunk as any).localAudioAvailable || chunk.hasAudioSaved)) {
+      const localAudio = await loadLocalChunkAudioBase64(sessionId, chunk.id);
+      if (localAudio) {
+        audioUrl = URL.createObjectURL(new Blob([localAudio], { type: 'audio/wav' }));
+      }
+    }
+    if (!audioUrl) {
+      setError(`Clip ${chunk.id} audio is not available in server storage or this browser.`);
+      return;
+    }
+
+    setActiveAudioLabel(`Clip ${chunk.id} (${chunk.wordCount}w)`);
+    setActiveAudioSrc(audioUrl);
+    setTimeout(() => {
+      if (audioRef.current) {
+        audioRef.current.currentTime = 0;
+        audioRef.current.play().then(() => setIsPlaying(true)).catch(() => {});
+      }
+    }, 100);
+  };
+
   const rebuildAllMessagesAudioForSettings = (
-    nextWarmth: AcousticWarmthMode,
-    nextSpeed: number,
-    nextGapSec: number
+    _warmth: AcousticWarmthMode,
+    _speed: number,
+    gapSeconds: number
   ) => {
-    setMessages((prev) =>
-      prev.map((m) => {
-        if (!m.completedChunks?.length) return m;
-        const updatedChunks = reconstructChunkAudioUrls(m.completedChunks, nextWarmth, nextSpeed, m.id);
-        const readyBase64s = updatedChunks.map((c) => c.audioBase64!).filter(Boolean);
-        let nextMasterUrl = m.masterAudioUrl;
-        if (readyBase64s.length > 0) {
-          try {
-            const merged = mergeWavAudioChunks(readyBase64s, nextWarmth, nextSpeed, nextGapSec);
-            nextMasterUrl = merged.blobUrl;
-          } catch {}
-        } else if (updatedChunks.some((c) => (c as any).hasAudioSaved || c.audioUrl)) {
-          nextMasterUrl = `/api/session/master-audio/${encodeURIComponent(m.id)}`;
-        }
-        return {
-          ...m,
-          completedChunks: updatedChunks,
-          masterAudioUrl: nextMasterUrl,
-        };
-      })
+    setMessages((previous) =>
+      previous.map((message) =>
+        message.completedChunks?.some((chunk) => isChunkAudioReady(chunk))
+          ? {
+              ...message,
+              masterAudioUrl: `/api/session/master-audio/${encodeURIComponent(message.id)}?gap=${encodeURIComponent(gapSeconds)}`,
+            }
+          : message
+      )
     );
   };
 
@@ -766,7 +770,7 @@ export function AppContent() {
     sectionText: string,
     sectionWords: number,
     topicSlug: string
-  ): Promise<{ audioBase64: string; audioUrl: string }> => {
+  ): Promise<{ audioUrl: string; driveLink?: string }> => {
     let ttsData: any = null;
     let attempts = 0;
     const maxAttempts = 8;
@@ -847,29 +851,70 @@ export function AppContent() {
       throw new Error(`Audio synthesis paused for Clip ${partNum}. Your 550–600w script is saved! Click Resume to synthesize audio.`);
     }
 
-    // Store pristine canonical 1.0x WAV in chunk.audioBase64 so changing Speed/Warmth later never double-resamples or degrades audio!
-    // Apply Velvet Sleep Acoustic Softener DSP & Speed Factor (e.g. 0.96x) for the immediate playback/download Blob URL:
-    const rawCanonical = softenSingleWavBase64(ttsData.audioBase64, 'natural', 1.0);
-    const softenedForPlayback = softenSingleWavBase64(rawCanonical.audioBase64, acousticWarmth, playbackRate);
+    const processedAudio = await softenWavInWorker(ttsData.audioBase64, acousticWarmth, playbackRate);
+    let audioUrl: string | undefined;
+    let driveLink: string | undefined;
+    let serverSaved = false;
+    let localSaved = false;
 
-    // Persist individual chunk audio brick to server disk & IndexedDB immediately so it survives any browser cache clear
-    fetch('/api/session/save-chunk-audio', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId: assistantMsgId,
-        chunkId: partNum,
-        audioBase64: rawCanonical.audioBase64,
-      }),
-    }).catch(() => {});
-    saveChunkAudioBricks(assistantMsgId, [{ id: partNum, audioBase64: rawCanonical.audioBase64 }]).catch(() => {});
+    try {
+      const serverSave = await fetch('/api/session/save-chunk-audio', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: assistantMsgId,
+          chunkId: partNum,
+          audioBase64: processedAudio.audioBase64,
+        }),
+      });
+      if (!serverSave.ok) throw new Error(`Server audio save failed (${serverSave.status})`);
+      const result = await serverSave.json();
+      if (!result?.success) throw new Error('Server did not confirm audio save');
+      serverSaved = true;
+    } catch (saveError: any) {
+      setDriveSaveStatus(`Clip ${partNum} server backup failed; trying browser backup`);
+    }
+
+    localSaved = await saveChunkAudioBricks(assistantMsgId, [{ id: partNum, audioBase64: processedAudio.audioBase64 }]);
+    if (!serverSaved && !localSaved) {
+      throw new Error(`Clip ${partNum} audio could not be saved to server or browser storage.`);
+    }
+    if (serverSaved) {
+      audioUrl = `/api/session/chunk-audio/${encodeURIComponent(assistantMsgId)}/${encodeURIComponent(partNum)}`;
+    } else {
+      audioUrl = processedAudio.blobUrl;
+    }
+
+    if (autoSaveToDrive) {
+      if (!driveUser) {
+        setDriveSaveStatus(`Clip ${partNum} is backed up locally; connect Drive for cloud backup`);
+      } else {
+        setDriveUploadingChunkId(partNum);
+        setDriveSaveStatus(`Uploading Clip ${partNum} to Google Drive...`);
+        try {
+          const upload = await uploadBlobToGoogleDrive({
+            filename: `${topicSlug}-clip-${String(partNum).padStart(2, '0')}.wav`,
+            blob: processedAudio.blob,
+            mimeType: 'audio/wav',
+            description: `AudioSpark generated clip ${partNum} for session ${assistantMsgId}`,
+          });
+          driveLink = upload.webViewLink || `https://drive.google.com/open?id=${upload.id}`;
+          setDriveSaveStatus(`Clip ${partNum} backed up to Google Drive`);
+        } catch (uploadError: any) {
+          setDriveSaveStatus(`Clip ${partNum} Drive upload failed: ${uploadError?.message || 'unknown error'}`);
+          stopRequestedRef.current = true;
+        } finally {
+          setDriveUploadingChunkId(null);
+        }
+      }
+    }
 
     if (autoDownloadClips && downloadPackageMode !== 'single_master_wav') {
       const padded = String(partNum).padStart(2, '0');
-      triggerSingleWavDownload(softenedForPlayback.blobUrl, `${padded}-${topicSlug}-clip-${partNum}.wav`);
+      triggerSingleWavDownload(audioUrl, `${padded}-${topicSlug}-clip-${partNum}.wav`);
     }
 
-    return { audioBase64: rawCanonical.audioBase64, audioUrl: softenedForPlayback.blobUrl };
+    return { audioUrl, driveLink };
   };
 
   // =========================================================================
@@ -900,7 +945,7 @@ export function AppContent() {
       );
 
       const topicSlug = getScriptSlug(targetMsg.plan?.topic || 'sleep-science', 4);
-      const { audioBase64, audioUrl } = await synthesizeChunkAudio(
+      const { audioUrl, driveLink } = await synthesizeChunkAudio(
         msgId,
         chunk.id,
         chunk.text,
@@ -909,7 +954,7 @@ export function AppContent() {
       );
 
       const updatedChunks = targetMsg.completedChunks.map((c) =>
-        c.id === chunkId ? { ...c, audioBase64, audioUrl } : c
+        c.id === chunkId ? { ...c, audioBase64: undefined, audioUrl, driveLink, hasAudioSaved: true } : c
       );
       const fullCombinedScript = updatedChunks.map((c) => c.text).join('\n\n');
 
@@ -1060,7 +1105,7 @@ export function AppContent() {
         )
       );
 
-      const { audioBase64, audioUrl } = await synthesizeChunkAudio(
+      const { audioUrl, driveLink } = await synthesizeChunkAudio(
         msgId,
         chunk.id,
         newText,
@@ -1070,7 +1115,7 @@ export function AppContent() {
 
       const updatedChunks = targetMsg.completedChunks.map((c) =>
         c.id === chunkId
-          ? { ...c, text: newText, wordCount: newWords, audioBase64, audioUrl }
+          ? { ...c, text: newText, wordCount: newWords, audioBase64: undefined, audioUrl, driveLink, hasAudioSaved: true }
           : c
       );
       const fullCombinedScript = updatedChunks.map((c) => c.text).join('\n\n');
@@ -1195,7 +1240,7 @@ export function AppContent() {
             )
           );
 
-          const { audioBase64, audioUrl } = await synthesizeChunkAudio(
+          const { audioUrl, driveLink } = await synthesizeChunkAudio(
             assistantMsgId,
             existing.id,
             existing.text,
@@ -1207,6 +1252,7 @@ export function AppContent() {
             ...existing,
             audioBase64: undefined, // Audio brick is safely on disk & IndexedDB
             audioUrl,
+            driveLink,
             hasAudioSaved: true,
           };
 
@@ -1386,7 +1432,7 @@ export function AppContent() {
         });
 
         // 2B. Synthesize Audio & Auto-Download Clip
-        const { audioBase64, audioUrl } = await synthesizeChunkAudio(
+        const { audioUrl, driveLink } = await synthesizeChunkAudio(
           assistantMsgId,
           partNum,
           sectionText,
@@ -1398,6 +1444,7 @@ export function AppContent() {
           ...scriptReadyChunk,
           audioBase64: undefined, // Audio brick is safely on disk & IndexedDB
           audioUrl,
+          driveLink,
           hasAudioSaved: true,
         };
 
@@ -1449,127 +1496,48 @@ export function AppContent() {
 
       // STEP 3: Stitch Master Continuous WAV & Download according to selected Download Package Mode
       const finalSlug = getScriptSlug(fullCombinedScript, 5);
+      const serverMasterUrl = `/api/session/master-audio/${encodeURIComponent(assistantMsgId)}?gap=${encodeURIComponent(interClipPauseSec)}`;
+      const totalWords = generatedChunks.reduce((sum, c) => sum + (c.wordCount || 0), 0);
 
       if (downloadPackageMode === 'single_master_wav') {
-        const serverMasterUrl = `/api/session/master-audio/${encodeURIComponent(assistantMsgId)}`;
         setActiveAudioLabel(`Master Audio (${generatedChunks.length} Clips)`);
         setActiveAudioSrc(serverMasterUrl);
         triggerSingleWavDownload(serverMasterUrl, `${finalSlug}-master.wav`);
-        const totalWords = generatedChunks.reduce((sum, c) => sum + (c.wordCount || 0), 0);
-        setMessages((prev) =>
-          prev.map((msg) =>
-            msg.id === assistantMsgId
-              ? {
-                  ...msg,
-                  isProcessing: false,
-                  statusText: `Complete! All ${generatedChunks.length} clips (${totalWords.toLocaleString()} words) synthesized & Master WAV ready.`,
-                  progressPercent: 100,
-                  masterAudioUrl: serverMasterUrl,
-                  fullScriptText: fullCombinedScript,
-                  slug: finalSlug,
-                }
-              : msg
-          )
-        );
-        setIsBusy(false);
-        return;
-      }
-
-      let audioChunksBase64 = generatedChunks.map((c) => c.audioBase64!).filter(Boolean);
-      if (audioChunksBase64.length < generatedChunks.length) {
-        const resolvedList = await Promise.all(
-          generatedChunks.map(async (c) => {
-            if (c.audioBase64) return c.audioBase64;
-            const b64 = await fetchChunkAudioBase64(assistantMsgId, c.id);
-            return b64 || '';
-          })
-        );
-        audioChunksBase64 = resolvedList.filter(Boolean);
-      }
-
-      if (audioChunksBase64.length > 0) {
-        setMessages((prev) =>
-          prev.map((msg) =>
-            msg.id === assistantMsgId
-              ? {
-                  ...msg,
-                  statusText: `Applying Velvet Sleep Softener & stitching all ${generatedChunks.length} clips into continuous Master WAV...`,
-                  progressPercent: 94,
-                }
-              : msg
-          )
-        );
-
-        const mergeResult = mergeWavAudioChunks(
-          audioChunksBase64,
-          acousticWarmth,
-          playbackRate,
-          interClipPauseSec
-        );
-        setActiveAudioLabel(`Master Audio (${generatedChunks.length} Clips)`);
-        setActiveAudioSrc(mergeResult.blobUrl);
-
-        await downloadAudioOutput({
-          mode: downloadPackageMode,
-          baseSlug: finalSlug,
-          fullScriptText: fullCombinedScript,
-          chunks: generatedChunks.map((c) => ({ id: c.id, wordCount: c.wordCount, audioBase64: c.audioBase64 })),
-          masterAudioBytes: mergeResult.mergedBytes,
-          warmthMode: acousticWarmth,
-          speedFactor: playbackRate,
-        });
-
-        const totalWords = generatedChunks.reduce((sum, c) => sum + (c.wordCount || 0), 0);
-
-        setMessages((prev) =>
-          prev.map((msg) =>
-            msg.id === assistantMsgId
-              ? {
-                  ...msg,
-                  isProcessing: false,
-                  statusText: `Complete! All ${generatedChunks.length} clips (${totalWords.toLocaleString()} words) synthesized & downloaded.`,
-                  progressPercent: 100,
-                  masterAudioUrl: mergeResult.blobUrl,
-                  fullScriptText: fullCombinedScript,
-                  slug: finalSlug,
-                }
-              : msg
-          )
-        );
       } else {
-        const serverMasterUrl = `/api/session/master-audio/${encodeURIComponent(assistantMsgId)}`;
+        const packageUrl = `/api/session/download-zip/${encodeURIComponent(assistantMsgId)}?mode=${encodeURIComponent(downloadPackageMode)}&gap=${encodeURIComponent(interClipPauseSec)}`;
+        const packageName = downloadPackageMode === 'parts_only' ? 'parts-only.zip' : 'parts-and-master.zip';
+        triggerSingleWavDownload(packageUrl, `${finalSlug}-${packageName}`);
         setActiveAudioLabel(`Master Audio (${generatedChunks.length} Clips)`);
         setActiveAudioSrc(serverMasterUrl);
-        const totalWords = generatedChunks.reduce((sum, c) => sum + (c.wordCount || 0), 0);
-
-        setMessages((prev) =>
-          prev.map((msg) =>
-            msg.id === assistantMsgId
-              ? {
-                  ...msg,
-                  isProcessing: false,
-                  statusText: `Complete! All ${generatedChunks.length} clips (${totalWords.toLocaleString()} words) ready to play or download.`,
-                  progressPercent: 100,
-                  masterAudioUrl: serverMasterUrl,
-                  fullScriptText: fullCombinedScript,
-                  slug: finalSlug,
-                }
-              : msg
-          )
-        );
       }
 
-        await persistSessionState({
-          id: assistantMsgId,
-          userPrompt,
-          topic,
-          targetWords,
-          subtopics: subtopicsList,
-          completedChunks: generatedChunks,
-          fullCombinedScript,
-          selectedVoice,
-          isComplete: true,
-        });
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === assistantMsgId
+            ? {
+                ...msg,
+                isProcessing: false,
+                statusText: `Complete! All ${generatedChunks.length} clips (${totalWords.toLocaleString()} words) saved; package download started.`,
+                progressPercent: 100,
+                masterAudioUrl: serverMasterUrl,
+                fullScriptText: fullCombinedScript,
+                slug: finalSlug,
+              }
+            : msg
+        )
+      );
+
+      await persistSessionState({
+        id: assistantMsgId,
+        userPrompt,
+        topic,
+        targetWords,
+        subtopics: subtopicsList,
+        completedChunks: generatedChunks,
+        fullCombinedScript,
+        selectedVoice,
+        isComplete: true,
+      });
     } catch (err: any) {
       console.error('Pipeline error:', err);
       const cleaned = cleanErrorMessage(err);
@@ -1597,6 +1565,7 @@ export function AppContent() {
   // NEW PROJECT (Saves previous session safely in History & resets workspace)
   // =========================================================================
   const handleNewProject = async () => {
+    if (isBusy) return;
     stopRequestedRef.current = true;
     if (audioRef.current) {
       audioRef.current.pause();
@@ -1845,7 +1814,7 @@ export function AppContent() {
             )
           );
 
-          const { audioBase64, audioUrl } = await synthesizeChunkAudio(
+          const { audioUrl, driveLink } = await synthesizeChunkAudio(
             msgId,
             c.id,
             c.text,
@@ -1853,7 +1822,7 @@ export function AppContent() {
             topicSlug
           );
 
-          currentChunks[idx] = { ...c, audioBase64, audioUrl, hasAudioSaved: true };
+          currentChunks[idx] = { ...c, audioBase64: undefined, audioUrl, driveLink, hasAudioSaved: true };
           const fullCombinedScript = currentChunks.map((ch) => ch.text).join('\n\n');
 
           setMessages((prev) =>
@@ -1881,22 +1850,9 @@ export function AppContent() {
         }
       }
 
-      const readyBase64s = currentChunks.map((c) => c.audioBase64!).filter(Boolean);
-      let masterAudioUrl: string | undefined = undefined;
-      if (readyBase64s.length > 0 && !stopRequestedRef.current) {
-        try {
-          const mergeResult = mergeWavAudioChunks(
-            readyBase64s,
-            acousticWarmth,
-            playbackRate,
-            interClipPauseSec
-          );
-          masterAudioUrl = mergeResult.blobUrl;
-        } catch {}
-      }
-      if (!masterAudioUrl && currentChunks.some((c) => isChunkAudioReady(c))) {
-        masterAudioUrl = `/api/session/master-audio/${encodeURIComponent(msgId)}`;
-      }
+      const masterAudioUrl = currentChunks.some((c) => (c as any).serverAudioAvailable || c.audioUrl?.startsWith('/api/session/chunk-audio/'))
+        ? `/api/session/master-audio/${encodeURIComponent(msgId)}?gap=${encodeURIComponent(interClipPauseSec)}`
+        : undefined;
 
       const fullCombinedScript = currentChunks.map((ch) => ch.text).join('\n\n');
       const finalSlug = getScriptSlug(fullCombinedScript, 5);
@@ -2145,98 +2101,35 @@ export function AppContent() {
 
     const chosenMode = explicitMode || downloadPackageMode;
     const finalSlug = getScriptSlug(targetMsg.fullScriptText || targetMsg.plan?.topic || 'narration', 5);
+    const clipCount = targetMsg.completedChunks.length;
 
     // Fast Single Master WAV download
     if (chosenMode === 'single_master_wav') {
-      const serverMasterUrl = `/api/session/master-audio/${encodeURIComponent(msgId)}`;
-      setActiveAudioLabel(`Master Audio (${targetMsg.completedChunks.length} Clips)`);
+      const serverMasterUrl = `/api/session/master-audio/${encodeURIComponent(msgId)}?gap=${encodeURIComponent(interClipPauseSec)}`;
+      setActiveAudioLabel(`Master Audio (${clipCount} Clips)`);
       setActiveAudioSrc(serverMasterUrl);
       triggerSingleWavDownload(serverMasterUrl, `${finalSlug}-master.wav`);
       return;
     }
 
-    setIsBusy(true);
-    try {
-      // Gather base64 for ZIP export
-      let resolvedChunks = [...targetMsg.completedChunks];
-      const missingB64Count = resolvedChunks.filter((c) => !c.audioBase64).length;
-
-      if (missingB64Count > 0) {
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === msgId
-              ? {
-                  ...m,
-                  statusText: `Retrieving audio clips for ZIP export (${resolvedChunks.length} clips)...`,
-                }
-              : m
-          )
-        );
-        resolvedChunks = await Promise.all(
-          resolvedChunks.map(async (c) => {
-            if (c.audioBase64) return c;
-            const b64 = await fetchChunkAudioBase64(msgId, c.id);
-            return b64 ? { ...c, audioBase64: b64 } : c;
-          })
-        );
-      }
-
-      const audioChunksBase64 = resolvedChunks
-        .map((c) => c.audioBase64!)
-        .filter(Boolean);
-
-      if (audioChunksBase64.length === 0) {
-        setError(
-          `Audio has not been synthesized for these ${targetMsg.completedChunks.length} saved script clips yet. Click "Synthesize Pending Audio" or "Resume Generation" to generate the WAV audio!`
-        );
-        setIsBusy(false);
-        return;
-      }
-
-      const mergeResult = mergeWavAudioChunks(
-        audioChunksBase64,
-        acousticWarmth,
-        playbackRate,
-        interClipPauseSec
-      );
-      setActiveAudioLabel(`Master Audio (${audioChunksBase64.length} Clips)`);
-      setActiveAudioSrc(mergeResult.blobUrl);
-
-      await downloadAudioOutput({
-        mode: chosenMode,
-        baseSlug: finalSlug,
-        fullScriptText: targetMsg.fullScriptText || resolvedChunks.map((c) => c.text).join('\n\n'),
-        chunks: resolvedChunks
-          .filter((c) => !!c.audioBase64)
-          .map((c) => ({ id: c.id, wordCount: c.wordCount, audioBase64: c.audioBase64 })),
-        masterAudioBytes: mergeResult.mergedBytes,
-        warmthMode: acousticWarmth,
-        speedFactor: playbackRate,
-      });
-
-      const modeLabel =
-        chosenMode === 'parts_only'
-          ? 'Individual Parts Only ZIP'
-          : 'Parts + Single Master WAV ZIP';
-
-      setMessages((prev) =>
-        prev.map((msg) =>
-          msg.id === msgId
-            ? {
-                ...msg,
-                masterAudioUrl: mergeResult.blobUrl,
-                slug: finalSlug,
-                statusText: `Downloaded ${modeLabel} (${audioChunksBase64.length} softened clips)!`,
-              }
-            : msg
-        )
-      );
-    } catch (e: any) {
-      console.error('Merge error:', e);
-      setError(cleanErrorMessage(e));
-    } finally {
-      setIsBusy(false);
-    }
+    const packageUrl = `/api/session/download-zip/${encodeURIComponent(msgId)}?mode=${encodeURIComponent(chosenMode)}&gap=${encodeURIComponent(interClipPauseSec)}`;
+    const filename = chosenMode === 'parts_only' ? 'parts-only.zip' : 'parts-and-master.zip';
+    triggerSingleWavDownload(packageUrl, `${finalSlug}-${filename}`);
+    const masterUrl = `/api/session/master-audio/${encodeURIComponent(msgId)}?gap=${encodeURIComponent(interClipPauseSec)}`;
+    setActiveAudioLabel(`Master Audio (${clipCount} Clips)`);
+    setActiveAudioSrc(masterUrl);
+    setMessages((prev) =>
+      prev.map((msg) =>
+        msg.id === msgId
+          ? {
+              ...msg,
+              masterAudioUrl: masterUrl,
+              slug: finalSlug,
+              statusText: `Started server-side ${filename} download for ${clipCount} clips.`,
+            }
+          : msg
+      )
+    );
   };
 
   return (
@@ -2298,7 +2191,7 @@ export function AppContent() {
             {/* Full-Range Speed Slider + Quick Presets (0.96x, 1.0x, 1.05x, 1.1x, 1.15x) */}
             <div
               className="flex flex-wrap items-center gap-1.5 bg-slate-950 border border-cyan-500/40 rounded-lg px-2.5 py-1 text-[11px]"
-              title="Adjust narration speed from 0.80x to 1.25x (including 0.96x, 1.0x, 1.05x, 1.10x, 1.15x; baked into downloaded WAVs)"
+              title="Speed is baked into clips when generated; changing this affects clips generated from now on."
             >
               <span className="text-slate-400">Speed:</span>
               <input
@@ -2352,7 +2245,7 @@ export function AppContent() {
                 rebuildAllMessagesAudioForSettings(nextWarmth, playbackRate, interClipPauseSec);
               }}
               className="bg-emerald-950/70 border border-emerald-500/40 rounded-lg px-2.5 py-1 text-[11px] font-semibold text-emerald-300 focus:outline-none focus:border-emerald-400 cursor-pointer"
-              title="Velvet Sleep DSP removes high-frequency sharpness and sibilance for peaceful listening"
+              title="Tone is baked into clips when generated; changing this affects clips generated from now on."
             >
               <option value="velvet">Audio Tone: Velvet Soft (Unsharp & Peaceful)</option>
               <option value="deep_warmth">Audio Tone: Deep Nocturnal Warmth (Ultra-Soft)</option>
@@ -2402,6 +2295,50 @@ export function AppContent() {
               <span>Auto-DL Each Part</span>
             </label>
 
+            <div className="flex items-center gap-2 bg-slate-950 border border-emerald-800/70 rounded-lg px-2 py-1 text-[11px]">
+              <button
+                type="button"
+                disabled={isConnectingDrive}
+                onClick={async () => {
+                  if (driveUser) {
+                    await googleLogout();
+                    setDriveUser(null);
+                    setDriveSaveStatus('Drive disconnected');
+                    return;
+                  }
+                  setIsConnectingDrive(true);
+                  try {
+                    const result = await googleSignIn();
+                    if (result) {
+                      setDriveUser(result.user);
+                      setDriveSaveStatus('Drive connected; new clips will upload automatically');
+                    }
+                  } catch (driveError: any) {
+                    setDriveSaveStatus(`Drive connection failed: ${driveError?.message || 'unknown error'}`);
+                  } finally {
+                    setIsConnectingDrive(false);
+                  }
+                }}
+                className="flex items-center gap-1 text-emerald-300 hover:text-emerald-200 disabled:opacity-50"
+                title={driveUser ? 'Disconnect Google Drive' : 'Connect Google Drive for per-clip backups'}
+              >
+                <GoogleDriveLogo />
+                <span>{isConnectingDrive ? 'Connecting...' : driveUser ? 'Drive Connected' : 'Connect Drive'}</span>
+              </button>
+              <label className="flex items-center gap-1 text-slate-300" title="Upload each completed audio clip directly to your Google Drive">
+                <input
+                  type="checkbox"
+                  checked={autoSaveToDrive}
+                  onChange={(e) => setAutoSaveToDrive(e.target.checked)}
+                  className="accent-emerald-400"
+                />
+                <span>Auto-save</span>
+              </label>
+            </div>
+            <span className="max-w-48 truncate text-[10px] text-slate-500" title={driveSaveStatus}>
+              {driveUploadingChunkId ? `Uploading clip ${driveUploadingChunkId}...` : driveSaveStatus}
+            </span>
+
             <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded-lg p-0.5">
               <select
                 value={selectedVoice}
@@ -2429,8 +2366,9 @@ export function AppContent() {
             <button
               type="button"
               onClick={handleNewProject}
-              className="px-2.5 py-1 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 cursor-pointer shadow-sm shadow-cyan-500/20 transition"
-              title="Start a brand new project (Current project remains safely saved in History)"
+              disabled={isBusy}
+              className="px-2.5 py-1 rounded-lg bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 font-bold text-xs flex items-center gap-1.5 cursor-pointer disabled:cursor-not-allowed shadow-sm shadow-cyan-500/20 transition"
+              title={isBusy ? 'Pause generation and wait for the current clip to save before starting another project' : 'Start a brand new project (Current project remains safely saved in History)'}
             >
               <PlusCircle className="w-3.5 h-3.5" />
               <span>+ New Project</span>
@@ -2952,6 +2890,17 @@ export function AppContent() {
                                               Script Saved · Audio Pending
                                             </span>
                                           )}
+                                          {chunk.driveLink && (
+                                            <a
+                                              href={chunk.driveLink}
+                                              target="_blank"
+                                              rel="noreferrer"
+                                              className="text-[9px] text-emerald-300 hover:text-emerald-200 underline"
+                                              title="Open this backed-up clip in Google Drive"
+                                            >
+                                              Drive backup
+                                            </a>
+                                          )}
                                         </div>
                                         <p className="text-[11px] text-slate-400 truncate mt-0.5">
                                           {chunk.title}
@@ -2993,36 +2942,26 @@ export function AppContent() {
                                           )}
                                         </button>
 
-                                        {chunk.audioUrl ? (
+                                        {chunk.audioUrl || (chunk as any).localAudioAvailable ? (
                                           <>
                                             <button
                                               type="button"
-                                              onClick={() => {
-                                                setActiveAudioLabel(`Clip ${chunk.id} (${chunk.wordCount}w)`);
-                                                setActiveAudioSrc(chunk.audioUrl!);
-                                                setTimeout(() => {
-                                                  if (audioRef.current) {
-                                                    audioRef.current.currentTime = 0;
-                                                    audioRef.current
-                                                      .play()
-                                                      .then(() => setIsPlaying(true))
-                                                      .catch(() => {});
-                                                  }
-                                                }, 100);
-                                              }}
+                                              onClick={() => handlePlayChunkAudio(msg.id, chunk)}
                                               className="p-1.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 rounded cursor-pointer"
                                               title="Play clip audio"
                                             >
                                               <Play className="w-3.5 h-3.5 fill-cyan-300" />
                                             </button>
-                                            <a
-                                              href={chunk.audioUrl}
-                                              download={`${String(chunk.id).padStart(2, '0')}-${msg.slug || 'clip'}-part-${chunk.id}.wav`}
-                                              className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-cyan-300 rounded cursor-pointer"
-                                              title="Download clip WAV"
-                                            >
-                                              <Download className="w-3.5 h-3.5" />
-                                            </a>
+                                            {chunk.audioUrl && (
+                                              <a
+                                                href={chunk.audioUrl}
+                                                download={`${String(chunk.id).padStart(2, '0')}-${msg.slug || 'clip'}-part-${chunk.id}.wav`}
+                                                className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-cyan-300 rounded cursor-pointer"
+                                                title="Download clip WAV"
+                                              >
+                                                <Download className="w-3.5 h-3.5" />
+                                              </a>
+                                            )}
                                             <button
                                               type="button"
                                               onClick={() => handleResynthesizeSingleClip(msg.id, chunk.id)}

@@ -5,6 +5,35 @@
 
 export type AcousticWarmthMode = 'velvet' | 'deep_warmth' | 'natural';
 
+let audioProcessingRequestId = 0;
+
+export function softenWavInWorker(
+  audioBase64: string,
+  warmthMode: AcousticWarmthMode,
+  speedFactor: number
+): Promise<{ audioBase64: string; audioBytes: Uint8Array; blob: Blob; blobUrl: string }> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./audioProcessing.worker.ts', import.meta.url), { type: 'module' });
+    const id = ++audioProcessingRequestId;
+    worker.onmessage = (event: MessageEvent<{ id: number; audioBase64?: string; audioBuffer?: ArrayBuffer; error?: string }>) => {
+      if (event.data.id !== id) return;
+      worker.terminate();
+      if (event.data.error || !event.data.audioBase64 || !event.data.audioBuffer) {
+        reject(new Error(event.data.error || 'Audio processing returned no WAV data.'));
+        return;
+      }
+      const audioBytes = new Uint8Array(event.data.audioBuffer);
+      const blob = new Blob([event.data.audioBuffer], { type: 'audio/wav' });
+      resolve({ audioBase64: event.data.audioBase64, audioBytes, blob, blobUrl: URL.createObjectURL(blob) });
+    };
+    worker.onerror = (event) => {
+      worker.terminate();
+      reject(new Error(event.message || 'Audio processing worker failed.'));
+    };
+    worker.postMessage({ id, audioBase64, warmthMode, speedFactor });
+  });
+}
+
 export function base64ToUint8Array(b64: string): Uint8Array {
   const cleanB64 = b64.replace(/^data:audio\/\w+;base64,/, '').trim();
   const binaryString = atob(cleanB64);
