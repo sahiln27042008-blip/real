@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix AudioSpark - AI Text-to-Speech Studio",
+  "description": "Convert text into expressive speech using Gemini 3.8 Flash TTS with vocal bursts, style direction, dual-speaker dialogues, and audio export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
