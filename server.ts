@@ -5,6 +5,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
+import JSZip from 'jszip';
 
 dotenv.config();
 
@@ -299,6 +300,84 @@ app.get('/api/session/master-audio/:sessionId', (req, res) => {
   } catch (err: any) {
     console.error('Error generating master audio on server:', err);
     return res.status(500).json({ error: err?.message || 'Failed to generate master audio' });
+  }
+});
+
+// Server-side ZIP export - streams directly from server disk with ZERO client memory overhead
+app.get('/api/session/download-zip/:sessionId', async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const mode = (req.query.mode as string) || 'both_parts_and_master';
+    const history = readServerHistory();
+    const current = fs.existsSync(SESSION_FILE) ? JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8')) : null;
+    const session = (current && current.id === sessionId) ? current : history.find((h: any) => h.id === sessionId);
+
+    if (!session || !Array.isArray(session.completedChunks) || session.completedChunks.length === 0) {
+      return res.status(404).json({ error: 'Session has no clips to package' });
+    }
+
+    const zip = new JSZip();
+    const filenameSlug = (session.topic || 'narration').toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
+
+    // 1. Full script text
+    const fullScript = session.fullCombinedScript || session.fullScriptText || session.completedChunks.map((c: any) => c.text).join('\n\n');
+    if (fullScript) {
+      zip.file(`${filenameSlug}-complete-script.txt`, fullScript);
+    }
+
+    // 2. Individual clips
+    if (mode === 'both_parts_and_master' || mode === 'parts_only') {
+      for (const c of session.completedChunks) {
+        const p = getChunkAudioPath(sessionId, c.id);
+        if (fs.existsSync(p)) {
+          const b64 = fs.readFileSync(p, 'utf-8').trim();
+          const buf = Buffer.from(b64, 'base64');
+          const pad = String(c.id).padStart(2, '0');
+          zip.file(`parts/${pad}-${filenameSlug}-clip-${c.id}.wav`, buf);
+        }
+      }
+    }
+
+    // 3. Stitched Master WAV
+    if (mode === 'both_parts_and_master' || mode === 'single_master_wav') {
+      const pcmBuffers: Buffer[] = [];
+      let firstHeader: Buffer | null = null;
+      let totalPcm = 0;
+
+      for (const c of session.completedChunks) {
+        const p = getChunkAudioPath(sessionId, c.id);
+        if (!fs.existsSync(p)) continue;
+        const b64 = fs.readFileSync(p, 'utf-8').trim();
+        const buf = Buffer.from(b64, 'base64');
+        if (buf.length <= 44) continue;
+        if (!firstHeader) firstHeader = Buffer.from(buf.subarray(0, 44));
+        const pcm = buf.subarray(44);
+        pcmBuffers.push(pcm);
+        totalPcm += pcm.length;
+      }
+
+      if (firstHeader && totalPcm > 0) {
+        const masterWav = Buffer.alloc(44 + totalPcm);
+        firstHeader.copy(masterWav, 0, 0, 44);
+        masterWav.writeUInt32LE(36 + totalPcm, 4);
+        masterWav.writeUInt32LE(totalPcm, 40);
+        let offset = 44;
+        for (const pcm of pcmBuffers) {
+          pcm.copy(masterWav, offset);
+          offset += pcm.length;
+        }
+        zip.file(`${filenameSlug}-master-complete.wav`, masterWav);
+      }
+    }
+
+    const zipBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 4 } });
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Length', zipBuffer.length);
+    res.setHeader('Content-Disposition', `attachment; filename="${filenameSlug}-audio-package.zip"`);
+    return res.end(zipBuffer);
+  } catch (err: any) {
+    console.error('Error generating server ZIP:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to generate zip package' });
   }
 });
 

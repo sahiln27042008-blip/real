@@ -316,13 +316,13 @@ export function mergeWavAudioChunks(
     offset += pcm.length;
   }
 
-  const mergedBase64 = uint8ArrayToBase64(merged);
+  // Blob is created directly from ArrayBuffer in 0ms without allocating 200MB+ base64 strings
   const blob = new Blob([merged.buffer as ArrayBuffer], { type: 'audio/wav' });
   const blobUrl = URL.createObjectURL(blob);
 
   return {
     mergedBytes: merged,
-    mergedBase64,
+    mergedBase64: '',
     blob,
     blobUrl,
   };

@@ -60,6 +60,7 @@ export interface PersistedUserPrefs {
   limitMode?: 'auto' | 'words' | 'minutes';
   limitValue?: string;
   autoDownloadClips?: boolean;
+  autoSaveToDrive?: boolean;
   draftPrompt?: string;
 }
 
@@ -93,6 +94,8 @@ export function stripAudioForLightweightMeta(sessionData: any): any {
         text: c.text,
         customPrompt: c.customPrompt,
         hasAudioSaved: Boolean(c.audioBase64 || c.hasAudioSaved),
+        driveLink: c.driveLink,
+        audioUrl: c.audioUrl,
       }))
     : [];
 

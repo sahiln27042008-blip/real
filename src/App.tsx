@@ -28,7 +28,10 @@ import {
   Upload,
   Sparkles,
   Edit3,
-  Clock
+  Clock,
+  ExternalLink,
+  LogOut,
+  FolderOpen,
 } from 'lucide-react';
 import { getScriptSlug } from './utils/fileNaming';
 import { downloadAudioOutput, DownloadPackageMode } from './utils/zipExport';
@@ -40,6 +43,7 @@ import {
 } from './utils/wavMerger';
 import {
   saveLocalSession,
+  saveChunkAudioBricks,
   clearActiveLocalSession,
   loadLocalSession,
   loadSessionsHistory,
@@ -51,6 +55,14 @@ import {
   saveUserPreferences,
   loadUserPreferences,
 } from './utils/sessionStorage';
+import {
+  googleSignIn,
+  logout as googleLogout,
+  initAuth as initGoogleAuth,
+  uploadBlobToGoogleDrive,
+  uploadUrlToGoogleDrive,
+} from './utils/googleDrive';
+import type { User as FirebaseUser } from 'firebase/auth';
 
 interface Voice {
   id: string;
@@ -76,6 +88,7 @@ interface CompletedChunk {
   audioBase64?: string;
   customPrompt?: string;
   hasAudioSaved?: boolean;
+  driveLink?: string;
 }
 
 interface SubtopicItem {
@@ -105,6 +118,9 @@ interface ChatMessage {
   masterAudioUrl?: string;
   fullScriptText?: string;
   slug?: string;
+  masterDriveLink?: string;
+  scriptDriveLink?: string;
+  zipDriveLink?: string;
 }
 
 const INITIAL_PROMPT_PRESET = `Write a complete, long-form, deeply exhaustive scientific sleep narration script on: "Stellar Collapse, Degeneracy Pressure, and the Schwarzschild Metric."
@@ -236,6 +252,26 @@ class CrashShieldErrorBoundary extends React.Component<
   }
 }
 
+const GoogleIcon = () => (
+  <svg className="w-4 h-4 flex-shrink-0" viewBox="0 0 48 48">
+    <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+    <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+    <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+    <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+  </svg>
+);
+
+const GoogleDriveLogo = () => (
+  <svg className="w-4 h-4 flex-shrink-0" viewBox="0 0 87.3 78">
+    <path d="m6.6 66.85 3.85 6.65c.8 1.4 1.95 2.5 3.3 3.3l13.75-23.8h-27.5c0 1.55.4 3.1 1.2 4.5z" fill="#0066da"/>
+    <path d="m43.65 25-13.75-23.8c-1.35.8-2.5 1.9-3.3 3.3l-25.4 44c-.8 1.4-1.2 2.95-1.2 4.5h27.5z" fill="#00ac47"/>
+    <path d="m73.55 76.8c1.35-.8 2.5-1.9 3.3-3.3l1.6-2.75 7.65-13.25c.8-1.4 1.2-2.95 1.2-4.5h-27.502l5.852 11.5z" fill="#ea4335"/>
+    <path d="m43.65 25 13.75-23.8c-1.35-.8-2.9-1.2-4.5-1.2h-18.5c-1.6 0-3.15.45-4.5 1.25z" fill="#00832d"/>
+    <path d="m59.8 53h-32.3l-13.75 23.8c1.35.8 2.9 1.2 4.5 1.2h50.8c1.6 0 3.15-.45 4.5-1.2z" fill="#26842a"/>
+    <path d="m73.4 26.5-12.7-22c-.8-1.4-1.95-2.5-3.3-3.3l-13.75 23.8 16.15 28h27.45c0-1.55-.4-3.1-1.2-4.5z" fill="#ffba00"/>
+  </svg>
+);
+
 export function AppContent() {
   const savedPrefs = loadUserPreferences();
 
@@ -248,9 +284,6 @@ export function AppContent() {
   );
 
   // Download Package Format Mode:
-  // 'both_parts_and_master' -> Parts + Entire Single Frame Master WAV
-  // 'single_master_wav'     -> No Parts, Just Single Frame Master WAV
-  // 'parts_only'            -> Only Individual Parts
   const [downloadPackageMode, setDownloadPackageMode] = useState<DownloadPackageMode>(
     (savedPrefs.downloadPackageMode as DownloadPackageMode) || 'both_parts_and_master'
   );
@@ -260,7 +293,24 @@ export function AppContent() {
   const [limitValue, setLimitValue] = useState<string>(savedPrefs.limitValue || '4000');
   const [autoDownloadClips, setAutoDownloadClips] = useState<boolean>(savedPrefs.autoDownloadClips ?? false);
 
-  // Input Mode: 'ai_prompt' (AI writes 550-600w scripts + audio) or 'paste_script' (Paste existing script -> split & synthesize audio)
+  // Google Drive Direct Cloud Storage State
+  const [driveUser, setDriveUser] = useState<FirebaseUser | null>(null);
+  const [isConnectingDrive, setIsConnectingDrive] = useState<boolean>(false);
+  const [autoSaveToDrive, setAutoSaveToDrive] = useState<boolean>(savedPrefs.autoSaveToDrive ?? true);
+  const [driveUploadingChunkId, setDriveUploadingChunkId] = useState<number | null>(null);
+  const [driveUploadingAction, setDriveUploadingAction] = useState<string | null>(null);
+  const [driveSuccessToast, setDriveSuccessToast] = useState<{ message: string; link?: string } | null>(null);
+
+  // Mandatory confirmation dialog for Workspace mutations
+  const [driveConfirmModal, setDriveConfirmModal] = useState<{
+    isOpen: boolean;
+    title: string;
+    description: string;
+    filename: string;
+    onConfirm: () => Promise<void>;
+  } | null>(null);
+
+  // Input Mode: 'ai_prompt' or 'paste_script'
   const [inputMode, setInputMode] = useState<'ai_prompt' | 'paste_script'>('ai_prompt');
   // Inter-clip silence gap in seconds when merging Master WAV
   const [interClipPauseSec, setInterClipPauseSec] = useState<number>(1.5);
@@ -284,7 +334,7 @@ export function AppContent() {
   const [historyList, setHistoryList] = useState<any[]>([]);
   const [lastAutoSavedAt, setLastAutoSavedAt] = useState<string>('Ready');
 
-  // Audio Playback & Baked-In WAV Speed (defaults to 0.96x Sleep Science Deceleration Pace)
+  // Audio Playback & Baked-In WAV Speed
   const [activeAudioSrc, setActiveAudioSrc] = useState<string | null>(null);
   const [activeAudioLabel, setActiveAudioLabel] = useState<string>('Master Audio');
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
@@ -296,18 +346,31 @@ export function AppContent() {
   const [isLooping, setIsLooping] = useState<boolean>(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  // Automatically persist user controls & draft prompt so a refresh never loses settings
+  // Listen to Google Auth state
   useEffect(() => {
-    saveUserPreferences({
-      selectedVoice,
-      acousticWarmth,
-      downloadPackageMode,
-      playbackRate,
-      limitMode,
-      limitValue,
-      autoDownloadClips,
-      draftPrompt: inputPrompt,
-    });
+    const unsub = initGoogleAuth(
+      (user) => setDriveUser(user),
+      () => setDriveUser(null)
+    );
+    return () => unsub();
+  }, []);
+
+  // Debounced auto-save of user controls & draft prompt so typing is silky smooth
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      saveUserPreferences({
+        selectedVoice,
+        acousticWarmth,
+        downloadPackageMode,
+        playbackRate,
+        limitMode,
+        limitValue,
+        autoDownloadClips,
+        autoSaveToDrive,
+        draftPrompt: inputPrompt,
+      });
+    }, 400);
+    return () => clearTimeout(timer);
   }, [
     selectedVoice,
     acousticWarmth,
@@ -316,6 +379,7 @@ export function AppContent() {
     limitMode,
     limitValue,
     autoDownloadClips,
+    autoSaveToDrive,
     inputPrompt,
   ]);
 
@@ -554,7 +618,8 @@ export function AppContent() {
       title: c.title,
       wordCount: c.wordCount,
       text: c.text,
-      audioBase64: c.audioBase64,
+      audioBase64: undefined, // Keep memory lean and clean (< 50KB)
+      hasAudioSaved: Boolean(c.hasAudioSaved || c.audioUrl || c.audioBase64),
       customPrompt: c.customPrompt,
     }));
 
@@ -564,7 +629,9 @@ export function AppContent() {
     };
 
     await saveLocalSession(sessionObj);
-    await refreshHistory();
+    if (payload.isComplete) {
+      await refreshHistory();
+    }
     setLastAutoSavedAt(
       new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
     );
@@ -702,7 +769,7 @@ export function AppContent() {
   ): Promise<{ audioBase64: string; audioUrl: string }> => {
     let ttsData: any = null;
     let attempts = 0;
-    const maxAttempts = 5;
+    const maxAttempts = 8;
 
     while (attempts < maxAttempts && !stopRequestedRef.current) {
       attempts++;
@@ -731,7 +798,31 @@ export function AppContent() {
               msg.id === assistantMsgId
                 ? {
                     ...msg,
-                    statusText: `Rate limit cooling down for Clip ${partNum} audio: auto-resuming in ${delay}s (Script is already saved!)...`,
+                    statusText: `Quota cooling down for Clip ${partNum} audio: auto-resuming in ${delay}s (Script is safely saved)...`,
+                  }
+                : msg
+            )
+          );
+          await new Promise((r) => setTimeout(r, 1000));
+          delay--;
+        }
+        continue;
+      }
+
+      if (
+        ttsRes.status === 503 ||
+        ttsData?.is503 ||
+        String(ttsData?.error || '').includes('503') ||
+        String(ttsData?.error || '').includes('high demand')
+      ) {
+        let delay = 6 * attempts;
+        while (delay > 0 && !stopRequestedRef.current) {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? {
+                    ...msg,
+                    statusText: `API busy during Clip ${partNum} audio. Waiting for capacity (${delay}s remaining, attempt ${attempts}/${maxAttempts})...`,
                   }
                 : msg
             )
@@ -744,7 +835,7 @@ export function AppContent() {
 
       if (!ttsRes.ok) {
         if (attempts < maxAttempts) {
-          await new Promise((r) => setTimeout(r, 2000));
+          await new Promise((r) => setTimeout(r, 3000 * attempts));
           continue;
         }
         throw new Error(ttsData?.error || `TTS synthesis failed for Clip ${partNum} (Script is saved — click Resume to retry audio)`);
@@ -761,7 +852,7 @@ export function AppContent() {
     const rawCanonical = softenSingleWavBase64(ttsData.audioBase64, 'natural', 1.0);
     const softenedForPlayback = softenSingleWavBase64(rawCanonical.audioBase64, acousticWarmth, playbackRate);
 
-    // Persist individual chunk audio brick to server disk immediately so it survives any browser cache clear
+    // Persist individual chunk audio brick to server disk & IndexedDB immediately so it survives any browser cache clear
     fetch('/api/session/save-chunk-audio', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -771,6 +862,7 @@ export function AppContent() {
         audioBase64: rawCanonical.audioBase64,
       }),
     }).catch(() => {});
+    saveChunkAudioBricks(assistantMsgId, [{ id: partNum, audioBase64: rawCanonical.audioBase64 }]).catch(() => {});
 
     if (autoDownloadClips && downloadPackageMode !== 'single_master_wav') {
       const padded = String(partNum).padStart(2, '0');
@@ -1113,7 +1205,7 @@ export function AppContent() {
 
           generatedChunks[idx] = {
             ...existing,
-            audioBase64,
+            audioBase64: undefined, // Audio brick is safely on disk & IndexedDB
             audioUrl,
             hasAudioSaved: true,
           };
@@ -1304,8 +1396,9 @@ export function AppContent() {
 
         generatedChunks[currentChunkIndex] = {
           ...scriptReadyChunk,
-          audioBase64,
+          audioBase64: undefined, // Audio brick is safely on disk & IndexedDB
           audioUrl,
+          hasAudioSaved: true,
         };
 
         cumulativeWords = generatedChunks.reduce((sum, c) => sum + (c.wordCount || 0), 0);
@@ -1355,6 +1448,33 @@ export function AppContent() {
       }
 
       // STEP 3: Stitch Master Continuous WAV & Download according to selected Download Package Mode
+      const finalSlug = getScriptSlug(fullCombinedScript, 5);
+
+      if (downloadPackageMode === 'single_master_wav') {
+        const serverMasterUrl = `/api/session/master-audio/${encodeURIComponent(assistantMsgId)}`;
+        setActiveAudioLabel(`Master Audio (${generatedChunks.length} Clips)`);
+        setActiveAudioSrc(serverMasterUrl);
+        triggerSingleWavDownload(serverMasterUrl, `${finalSlug}-master.wav`);
+        const totalWords = generatedChunks.reduce((sum, c) => sum + (c.wordCount || 0), 0);
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === assistantMsgId
+              ? {
+                  ...msg,
+                  isProcessing: false,
+                  statusText: `Complete! All ${generatedChunks.length} clips (${totalWords.toLocaleString()} words) synthesized & Master WAV ready.`,
+                  progressPercent: 100,
+                  masterAudioUrl: serverMasterUrl,
+                  fullScriptText: fullCombinedScript,
+                  slug: finalSlug,
+                }
+              : msg
+          )
+        );
+        setIsBusy(false);
+        return;
+      }
+
       let audioChunksBase64 = generatedChunks.map((c) => c.audioBase64!).filter(Boolean);
       if (audioChunksBase64.length < generatedChunks.length) {
         const resolvedList = await Promise.all(
@@ -1366,8 +1486,6 @@ export function AppContent() {
         );
         audioChunksBase64 = resolvedList.filter(Boolean);
       }
-
-      const finalSlug = getScriptSlug(fullCombinedScript, 5);
 
       if (audioChunksBase64.length > 0) {
         setMessages((prev) =>
